@@ -187,6 +187,62 @@ async def test_websocket_reconnect_resigns_hmac_headers(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_real_socketio_reconnect_loop_reinvokes_header_callable(monkeypatch):
+    """Drive python-socketio's actual reconnect loop, not a fake.
+
+    Stub the Engine.IO transport to fail every attempt and assert the library
+    re-resolves the SDK's header callable on each one. The other tests only
+    show a callable was stored; this one shows the library honours it.
+    """
+    import engineio
+    import socketio
+
+    counter = iter(range(1, 100))
+    monkeypatch.setattr(
+        "limitless_sdk.websocket.client._build_iso_timestamp",
+        lambda: f"2026-03-30T12:{next(counter):02d}:00.000Z",
+    )
+
+    client = WebSocketClient(
+        WebSocketConfig(
+            hmac_credentials=HMACCredentials(token_id="token-123", secret="c2VjcmV0"),
+        )
+    )
+
+    sio = socketio.AsyncClient(
+        reconnection=True,
+        reconnection_delay=0.01,
+        reconnection_delay_max=0.02,
+        reconnection_attempts=3,
+        randomization_factor=0,
+    )
+    attempts = []
+
+    async def failing_eio_connect(url, headers=None, **kwargs):
+        attempts.append(dict(headers or {}))
+        raise engineio.exceptions.ConnectionError("refused")
+
+    monkeypatch.setattr(sio.eio, "connect", failing_eio_connect)
+
+    with pytest.raises(socketio.exceptions.ConnectionError):
+        await sio.connect(
+            "wss://example.invalid",
+            headers=client._build_connection_headers,
+            transports=["websocket"],
+            namespaces=["/markets"],
+            retry=True,
+        )
+
+    # 1 initial attempt + 3 reconnect attempts, each freshly signed.
+    assert len(attempts) == 4
+    timestamps = [a["lmts-timestamp"] for a in attempts]
+    signatures = [a["lmts-signature"] for a in attempts]
+    assert len(set(timestamps)) == 4
+    assert len(set(signatures)) == 4
+    assert all(a["lmts-api-key"] == "token-123" for a in attempts)
+
+
+@pytest.mark.asyncio
 async def test_websocket_connect_uses_api_key_header_via_callable(monkeypatch):
     fake_client = _FakeAsyncClient()
     monkeypatch.setattr(

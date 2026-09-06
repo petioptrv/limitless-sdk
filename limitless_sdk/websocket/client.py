@@ -31,7 +31,9 @@ from .types import (
 
 DEFAULT_WS_URL = "wss://ws.limitless.exchange"
 DEFAULT_NAMESPACE = "/markets"
-# Engine.IO upgrade path signed for HMAC-authenticated connections.
+# Engine.IO WebSocket handshake path: the request the server verifies the HMAC
+# signature against. The client connects with transports=['websocket'] only,
+# so this is a direct handshake, not an upgrade from polling.
 HMAC_SIGNED_PATH = "/socket.io/?transport=websocket&EIO=4"
 SUPPORTED_SUBSCRIPTION_CHANNELS = {
     "subscribe_market_prices",
