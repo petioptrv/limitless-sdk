@@ -31,6 +31,8 @@ from .types import (
 
 DEFAULT_WS_URL = "wss://ws.limitless.exchange"
 DEFAULT_NAMESPACE = "/markets"
+# Engine.IO upgrade path signed for HMAC-authenticated connections.
+HMAC_SIGNED_PATH = "/socket.io/?transport=websocket&EIO=4"
 SUPPORTED_SUBSCRIPTION_CHANNELS = {
     "subscribe_market_prices",
     "subscribe_positions",
@@ -186,6 +188,33 @@ class WebSocketClient:
         await self.disconnect()
         await self.connect()
 
+    def _build_connection_headers(self) -> Dict[str, str]:
+        """Build the headers for one connection attempt.
+
+        Passed to python-socketio as a callable rather than a dict so that it
+        is invoked before every attempt, including the library's automatic
+        reconnects. HMAC signatures embed a timestamp that the server checks
+        against a replay window, so a signature computed for the first attempt
+        must not be reused on later ones.
+        """
+        headers = _build_sdk_tracking_headers()
+        if self._config.hmac_credentials:
+            timestamp = _build_iso_timestamp()
+            headers.update({
+                "lmts-api-key": self._config.hmac_credentials.token_id,
+                "lmts-timestamp": timestamp,
+                "lmts-signature": compute_hmac_signature(
+                    self._config.hmac_credentials.secret,
+                    timestamp,
+                    "GET",
+                    HMAC_SIGNED_PATH,
+                    "",
+                ),
+            })
+        elif self._config.api_key:
+            headers['X-API-Key'] = self._config.api_key
+        return headers
+
     async def connect(self) -> None:
         """Connect to the WebSocket server.
 
@@ -230,28 +259,13 @@ class WebSocketClient:
                 # Prepare connection URL (use base URL, namespace handled by Socket.IO)
                 ws_url = self._config.url
 
-                headers = _build_sdk_tracking_headers()
-                if self._config.hmac_credentials:
-                    timestamp = _build_iso_timestamp()
-                    headers.update({
-                        "lmts-api-key": self._config.hmac_credentials.token_id,
-                        "lmts-timestamp": timestamp,
-                        "lmts-signature": compute_hmac_signature(
-                            self._config.hmac_credentials.secret,
-                            timestamp,
-                            "GET",
-                            "/socket.io/?transport=websocket&EIO=4",
-                            "",
-                        ),
-                    })
-                elif self._config.api_key:
-                    headers['X-API-Key'] = self._config.api_key
-
-                # Connect with timeout to /markets namespace
+                # Headers are supplied as a callable so python-socketio
+                # rebuilds them (fresh HMAC timestamp + signature) before every
+                # attempt, including automatic reconnects.
                 await asyncio.wait_for(
                     self._sio.connect(
                         ws_url,
-                        headers=headers,
+                        headers=self._build_connection_headers,
                         transports=['websocket'],  # WebSocket only (no polling fallback)
                         namespaces=[DEFAULT_NAMESPACE],  # Connect to /markets namespace
                         wait_timeout=self._config.timeout

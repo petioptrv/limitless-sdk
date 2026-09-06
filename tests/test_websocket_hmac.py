@@ -26,15 +26,25 @@ class _FakeAsyncClient:
         return decorator
 
     async def connect(self, url, headers=None, transports=None, namespaces=None, wait_timeout=None):
+        # Mirror python-socketio: `headers` may be a dict or a callable that is
+        # invoked on every connection attempt (including auto-reconnects).
+        self.connection_headers = headers
+        resolved = headers() if callable(headers) else headers
         self.connect_calls.append(
             {
                 "url": url,
-                "headers": headers or {},
+                "headers": resolved or {},
                 "transports": transports,
                 "namespaces": namespaces,
                 "wait_timeout": wait_timeout,
             }
         )
+
+    def simulate_reconnect(self):
+        """Re-resolve the stored headers the way python-socketio's
+        ``_handle_reconnect`` does when it calls ``connect`` again."""
+        headers = self.connection_headers
+        return headers() if callable(headers) else headers
 
     async def disconnect(self):
         self.closed = True
@@ -105,6 +115,95 @@ async def test_websocket_connect_uses_hmac_headers(monkeypatch):
     assert headers["lmts-api-key"] == "token-123"
     assert headers["lmts-signature"] == "signature-123"
     assert "X-API-Key" not in headers
+
+
+@pytest.mark.asyncio
+async def test_websocket_connect_passes_headers_as_callable(monkeypatch):
+    fake_client = _FakeAsyncClient()
+    monkeypatch.setattr(
+        "limitless_sdk.websocket.client.AsyncClient",
+        lambda *args, **kwargs: fake_client,
+    )
+
+    client = WebSocketClient(
+        WebSocketConfig(
+            hmac_credentials=HMACCredentials(token_id="token-123", secret="c2VjcmV0"),
+            auto_reconnect=True,
+        )
+    )
+
+    await client.connect()
+
+    # python-socketio stores the `headers` argument and re-resolves it on each
+    # reconnect attempt; a plain dict would replay the original signature.
+    assert callable(fake_client.connection_headers)
+
+
+@pytest.mark.asyncio
+async def test_websocket_reconnect_resigns_hmac_headers(monkeypatch):
+    fake_client = _FakeAsyncClient()
+    timestamps = iter(
+        ["2026-03-30T12:00:00.000Z", "2026-03-30T12:05:00.000Z"]
+    )
+    signature_calls = []
+
+    def fake_compute_hmac_signature(secret, timestamp, method, path, body):
+        signature_calls.append(timestamp)
+        return f"signature-for-{timestamp}"
+
+    monkeypatch.setattr(
+        "limitless_sdk.websocket.client.AsyncClient",
+        lambda *args, **kwargs: fake_client,
+    )
+    monkeypatch.setattr(
+        "limitless_sdk.websocket.client.compute_hmac_signature",
+        fake_compute_hmac_signature,
+    )
+    monkeypatch.setattr(
+        "limitless_sdk.websocket.client._build_iso_timestamp",
+        lambda: next(timestamps),
+    )
+
+    client = WebSocketClient(
+        WebSocketConfig(
+            hmac_credentials=HMACCredentials(token_id="token-123", secret="c2VjcmV0"),
+            auto_reconnect=True,
+        )
+    )
+
+    await client.connect()
+    first = fake_client.connect_calls[0]["headers"]
+    second = fake_client.simulate_reconnect()
+
+    assert first["lmts-timestamp"] == "2026-03-30T12:00:00.000Z"
+    assert second["lmts-timestamp"] == "2026-03-30T12:05:00.000Z"
+    assert first["lmts-signature"] != second["lmts-signature"]
+    assert second["lmts-signature"] == "signature-for-2026-03-30T12:05:00.000Z"
+    assert second["lmts-api-key"] == "token-123"
+    assert signature_calls == [
+        "2026-03-30T12:00:00.000Z",
+        "2026-03-30T12:05:00.000Z",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_websocket_connect_uses_api_key_header_via_callable(monkeypatch):
+    fake_client = _FakeAsyncClient()
+    monkeypatch.setattr(
+        "limitless_sdk.websocket.client.AsyncClient",
+        lambda *args, **kwargs: fake_client,
+    )
+
+    client = WebSocketClient(
+        WebSocketConfig(api_key="api-key-123", auto_reconnect=False)
+    )
+
+    await client.connect()
+
+    headers = fake_client.connect_calls[0]["headers"]
+    assert headers["X-API-Key"] == "api-key-123"
+    assert "lmts-signature" not in headers
+    assert fake_client.simulate_reconnect()["X-API-Key"] == "api-key-123"
 
 
 @pytest.mark.asyncio
