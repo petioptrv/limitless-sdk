@@ -129,6 +129,9 @@ class WebSocketClient:
         # Connection lock for thread-safe operations
         self._connection_lock = asyncio.Lock()
 
+        # Intentional disconnect() in flight
+        self._closing = False
+
     @property
     def state(self) -> WebSocketState:
         """Get current connection state.
@@ -183,7 +186,7 @@ class WebSocketClient:
 
     async def _reconnect_with_new_auth(self) -> None:
         """Reconnect with new authentication credentials."""
-        await self.disconnect()
+        await self.disconnect(preserve_subscriptions=True)
         await self.connect()
 
     async def connect(self) -> None:
@@ -243,10 +246,6 @@ class WebSocketClient:
 
                 self._state = WebSocketState.CONNECTED
                 self._reconnect_attempts = 0
-                self._logger.info("WebSocket connected")
-
-                # Re-subscribe to all previous subscriptions
-                await self._resubscribe_all()
 
             except asyncio.TimeoutError:
                 self._state = WebSocketState.ERROR
@@ -289,10 +288,15 @@ class WebSocketClient:
                     self._logger.error(f"WebSocket connection error: {error_msg}")
                     raise
 
-    async def disconnect(self) -> None:
+    async def disconnect(self, preserve_subscriptions: bool = False) -> None:
         """Disconnect from the WebSocket server.
 
         Performs cleanup and clears all subscriptions.
+
+        Args:
+            preserve_subscriptions: Keep the tracked subscriptions so a
+                follow-up connect() can restore them. Used by the credential
+                rotation path, which disconnects only to reconnect.
 
         Example:
             >>> await client.disconnect()
@@ -302,14 +306,17 @@ class WebSocketClient:
 
         self._logger.info("Disconnecting from WebSocket")
 
+        self._closing = True
         try:
-            await self._sio.disconnect()
+            await self._sio.shutdown()
         except Exception as e:
             self._logger.error("Error during disconnect", e)
         finally:
             self._sio = None
             self._state = WebSocketState.DISCONNECTED
-            self._subscriptions.clear()
+            self._closing = False
+            if not preserve_subscriptions:
+                self._subscriptions.clear()
 
     async def subscribe(
         self,
@@ -570,43 +577,40 @@ class WebSocketClient:
             return
 
         # Connection events
-        @self._sio.on('connect')
+        @self._sio.on('connect', namespace=DEFAULT_NAMESPACE)
         async def on_connect():
+            reconnected = self._state in (
+                WebSocketState.RECONNECTING,
+                WebSocketState.DISCONNECTED,
+                WebSocketState.ERROR,
+            )
             self._state = WebSocketState.CONNECTED
-            self._reconnect_attempts = 0
-            self._logger.info("WebSocket connected")
 
-        @self._sio.on('disconnect')
-        async def on_disconnect():
-            self._state = WebSocketState.DISCONNECTED
-            self._logger.info("WebSocket disconnected")
+            if reconnected:
+                self._reconnect_attempts += 1
+                self._logger.info(
+                    "WebSocket reconnected",
+                    {"attempts": self._reconnect_attempts},
+                )
+            else:
+                self._logger.info("WebSocket connected")
 
-        @self._sio.on('connect_error')
+            await self._resubscribe_all()
+
+        @self._sio.on('disconnect', namespace=DEFAULT_NAMESPACE)
+        async def on_disconnect(*args):
+            if self._closing or not self._config.auto_reconnect:
+                self._state = WebSocketState.DISCONNECTED
+                self._logger.info("WebSocket disconnected")
+                return
+
+            self._state = WebSocketState.RECONNECTING
+            self._logger.warn("WebSocket connection lost, reconnecting...")
+
+        @self._sio.on('connect_error', namespace=DEFAULT_NAMESPACE)
         async def on_connect_error(data):
             self._state = WebSocketState.ERROR
             self._logger.error(f"WebSocket connection error: {data}")
-
-        # Reconnection events
-        @self._sio.on('reconnect_attempt')
-        async def on_reconnect_attempt():
-            self._state = WebSocketState.RECONNECTING
-            self._reconnect_attempts += 1
-            self._logger.info("Reconnecting...", {"attempt": self._reconnect_attempts})
-
-        @self._sio.on('reconnect')
-        async def on_reconnect():
-            self._state = WebSocketState.CONNECTED
-            self._logger.info("Reconnected", {"attempts": self._reconnect_attempts})
-            await self._resubscribe_all()
-
-        @self._sio.on('reconnect_error')
-        async def on_reconnect_error(data):
-            self._logger.error(f"Reconnection error: {data}")
-
-        @self._sio.on('reconnect_failed')
-        async def on_reconnect_failed():
-            self._state = WebSocketState.ERROR
-            self._logger.error("Reconnection failed")
 
     async def _resubscribe_all(self) -> None:
         """Re-subscribe to all previous subscriptions after reconnection.
@@ -645,8 +649,18 @@ class WebSocketClient:
         Returns:
             Unique subscription key
         """
-        market_slug = options.get('marketSlug', 'global')
-        return f"{channel}:{market_slug}"
+        targets = []
+        for singular, plural in (
+            ("marketSlug", "marketSlugs"),
+            ("marketAddress", "marketAddresses"),
+        ):
+            value = options.get(plural) or options.get(singular)
+            if isinstance(value, str):
+                targets.append(value)
+            elif value:
+                targets.extend(sorted(str(item) for item in value))
+
+        return f"{channel}:{','.join(targets) if targets else 'global'}"
 
     def _validate_subscription_channel(self, channel: SubscriptionChannel) -> None:
         """Validate websocket subscription channel against backend-supported events."""
